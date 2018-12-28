@@ -1,0 +1,202 @@
+#include "main.h"
+#include "main_process.h"
+#include "stm32f030_peripheral.h"
+#include "math.h"
+#include "sample.h"
+#include <string.h>
+#include <stdlib.h>
+#include "wireless_app.h"
+
+#define VERSION "V4.03-150813rf"
+//#define FACTION_TEST
+//#define DBG
+
+#define COLLISION_TIMES 3            // 碰撞次数。
+#define COLLISION_DELAY_SHORTA 0x1ff //10ms *512 = 5.1s.碰撞同步延时。
+#define COLLISION_DELAY_SHORT 0xff   //10ms *512 = 5.12s.碰撞同步延时。
+#define COM_TIME_OUT_COUNT 3000      //等待串口数据延时。
+#define NEW_DATA_DELAY 50
+typedef struct UserFLAG
+{
+    unsigned char fEnableEvent : 1;
+    unsigned char fEnableEventReadReturn : 1;
+    unsigned char fEnableEventRegReturn : 1;
+    unsigned char fEnableRetry : 1;
+    unsigned char fEnableEvent4 : 1;
+
+} USERFlag;
+
+USERFlag sFLAG = {
+#ifdef FACTION_TEST
+    .fEnableEvent = 1,
+#else
+    .fEnableEvent = 0,
+#endif
+};
+unsigned char fEnableCrcCheck;
+unsigned char Trans_mode = 1; /*传输模式*/
+unsigned char G_BandRate;
+unsigned int G_rand;
+unsigned char G_across_the_phase;
+unsigned char G_index = 1;     //路由深度。
+u16 Retry_delay = 1600;        //10ms*1600 = 16s 重试延时。
+u16 Collision_delay = 800;     //10ms*800 = 8.0s.碰撞固定延时。
+unsigned char Retry_times = 6; //重试次数
+
+u16 un_access_10sec_count;
+//static u16 G_rand_ext_delay;
+//static u16 G_tick;
+//static u16 min_count, ten_ms_count;
+
+//static u16 StaTick = 0;
+uint8_t UART_HAL_FLAG = 0; //2015-11-27 增加一个串口处理标志
+/*外部周局变量*/
+extern unsigned int time_tick;
+#define struct_com_Frame STDownUartFrame
+
+StructTypedefLowLevelDateFrame StructLowLevelFrame;   //底层载波数据接收结构体。
+StructTypedefLowLevelDateFrame StructLowLevelFrameTx; //底层载波数据发送结构体。
+static StructTimeOut event_timeout;                   //事件超时处理结构体。
+
+StructNearAddr Struct_near_addr;
+#pragma pack(4)
+static unsigned char lowlevel_buf[MAXDOWNBUF - 32];
+static unsigned char lowlevel_buf_tx[MAXDOWNBUF - 32];
+#pragma pack(2)
+unsigned char local_globe_addr[2]; //本节点短地址。
+unsigned char my_master_point[2];  //主节点短地址。
+unsigned char latest_up_addr[2];   //路由最近上行地址。
+unsigned char latest_up_addr2[2];  //无路由最近上行地址。
+#pragma pack()
+unsigned char Power_line_tx_flag = 0;   //电力载波数据发送请求标示。
+unsigned char bit_regiested_flag = 0;   //注册成功标志。
+unsigned char re_registed_flag = 0;     //重试注册标志。
+unsigned char collision_detected_count; //冲突检测次数。
+unsigned char my_phase_data_flag;
+
+/*数据发关后重试程序相关变量*/
+u16 powerline_idle_count;
+unsigned char powerline_need_retrans_flag; /*数据重试标志*/
+static void delay_ms(unsigned int ms);
+void Change_State(uint8_t state); //加一个切换无线状态
+
+void WDT_Feed(void)
+{
+#ifdef USE_WDT
+    HAL_IWDG_Refresh(&IwdgHandle);
+#endif
+}
+/****************************************数据结构初始化***************************************/
+void Init_lowlevel_para(void)
+{
+    sample_eval_init();
+    StructLowLevelFrame.len = 7;
+    StructLowLevelFrame.p_buf = lowlevel_buf;
+    StructLowLevelFrame.trans_type[0] = 0x91;
+    StructLowLevelFrame.trans_type[1] = 0xa1;
+    StructLowLevelFrame.trans_type[2] = 0xb1;
+
+    StructLowLevelFrameTx.len = 7;
+    StructLowLevelFrameTx.p_buf = lowlevel_buf_tx;
+    StructLowLevelFrameTx.trans_type[0] = 0x91;
+    StructLowLevelFrameTx.trans_type[1] = 0xa1;
+    StructLowLevelFrameTx.trans_type[2] = 0xb1;
+
+    Struct_near_addr.count = 0;
+
+    memset(Struct_near_addr.addr, 0xff, sizeof(Struct_near_addr.addr));
+    sFLAG.fEnableEvent = 0;
+}
+
+
+
+/*****************************************载波模块串口接收数据处理**********************************/
+
+void slave_com_receive_process(void)
+{
+    unsigned char *p, l, strlen, index;
+    l = struct_com_Frame.len_sub;
+    StructLowLevelFrame.len = l;   //基本数据长度。抄表数据区长度。
+
+    index = 0x01;
+
+    //发送到它上一节点
+    p = StructLowLevelFrame.p_buf;
+    *p++ = my_master_point[0];
+    *p++ = my_master_point[1];
+    *p++ = latest_up_addr2[0]; //最近上行地址。[0];
+    *p++ = latest_up_addr2[1];
+
+    p = StructLowLevelFrame.p_buf + 2 + 2 * index;
+
+    if (TEST_EVEN_IN) //有事件产生。
+        *p++ = (0x10 | fEnableCrcCheck | (G_BandRate << 2));
+    else
+        *p++ = fEnableCrcCheck + (G_BandRate << 2); //穿透抄表。
+    *p++ = StructLowLevelFrame.len;                 //抄表数据长度。
+
+    memcpy(p, struct_com_Frame.p_buf, StructLowLevelFrame.len);
+
+    p += StructLowLevelFrame.len;
+
+    strlen = p - StructLowLevelFrame.p_buf;
+
+    *p++ = sum_check(StructLowLevelFrame.p_buf, strlen);
+
+    //传输方式（1）+目标地址（2）+路由表（2*index）+ 控制码（1）+ 抄帧数据总长度（1）+CRC16，
+    StructLowLevelFrame.trans_type[0] = 0x91;       //强制设置通信类型
+    StructLowLevelFrame.len += (1 + 2 + 2 * (StructLowLevelFrame.trans_type[0] & 0x0f) + 1 + 1 + 1);
+
+    *p = CRC8_Tab(StructLowLevelFrame.p_buf, (strlen + 1));
+
+    /*模块优先直接发出数据*/
+    if (event_timeout.is_sta == 0) //不是主动上报模式。
+    {
+        power_line_carrier_transment(0, &StructLowLevelFrame);
+    }
+
+    /*开始空闲计时，置新数据重传标志*/
+    powerline_idle_count = NEW_DATA_DELAY + time_tick;
+    powerline_need_retrans_flag = 1;
+}
+
+/********************************main_process 主处理程序*****************************************/
+
+void main_process(void)
+{
+    uint8_t z_flag = 0;
+
+    while (1)
+    {
+        WDT_Feed();
+        /*串口接收数据处理*/
+       
+        if (struct_com_Frame.is_flag & 0x01) //串口接收数据处理。
+        {
+            struct_com_Frame.is_flag &= 0xfe;           
+             //DebugSendBytes(struct_com_Frame.p_buf,struct_com_Frame.len_sub);
+            slave_com_receive_process();
+            UART_HAL_FLAG = 0; //清串口处理标志
+        }
+         
+        z_flag = power_line_carrier_receive(&StructLowLevelFrame); //一直等待接收完
+        if (z_flag == 1)                                           /*线路上有数据，冲突帧，有效帧，错误帧，则清重试标志*/
+        {
+            //slave_power_line_carrier_receive_prcess();        //电力载波接收数据后处理
+
+            DebugSendBytes(StructLowLevelFrame.p_buf+6,StructLowLevelFrame.len-8);
+        }
+        
+        if (WIRELESS_STATUS == Wireless_RX_Finish)
+        {
+            DebugPrintf("WIRELESS_STATUS == Wireless_RX_Finish\n");
+            if(WIRELESS_STATUS == Wireless_RX_Finish)
+            {
+                Si4438_Receive_Start(Wireless_Channel[0]); 
+            }
+        }
+    }
+}
+
+/*end of file */
+

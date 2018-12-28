@@ -1,0 +1,1215 @@
+#include "stm32f030_peripheral.h"
+#include "stm32f0308_plc.h"
+#include <string.h>
+#include "wireless_app.h"
+
+CRC_HandleTypeDef CrcHandle;
+UART_HandleTypeDef UartHandleDown, UartHandleUp;
+StructTypedefUartFrame STDownUartFrame, STUpUartFrame;
+
+ADC_HandleTypeDef AdcHandle;
+ADC_ChannelConfTypeDef sADCConfig;
+
+static __IO ITStatus gTxUart1Flag = SET;   /*=.SET tx compile*/
+static __IO ITStatus gRxUart1Flag = RESET; /*= RESET receive empty*/
+static __IO ITStatus gTxUart2Flag = SET;
+static __IO ITStatus gRxUart2Flag = RESET;
+uint8_t gUpRxBuffer[4], gDownRxBuffer[4];
+
+static uint8_t gDownRxInterruptBuf[MAXDOWNBUF];
+//static uint8_t gDownTxBuffer[MAXDOWNBUF];
+
+static uint8_t gUpRxInterruptBuf[MAXDOWNBUF];
+//static uint8_t gUpTxBuffer[MAXDOWNBUF];
+
+static GPIO_InitTypeDef GPIO_InitStruct;
+static TIM_HandleTypeDef TimHandle;
+static TIM_OC_InitTypeDef sConfig;
+static uint32_t Period = 0;
+static FLASH_EraseInitTypeDef EraseInitStruct;
+uint8_t aResultDMA[680];
+
+extern void Signal_GPIO_EXTI_Callback(uint16_t GPIO_Pin);
+extern void ADC_SampleRelatedProcess(uint8_t *aResultDMA);
+void Crc_Init(void)
+{
+    __CRC_CLK_ENABLE();
+
+    /*##-1- Configure the CRC peripheral #######################################*/
+    CrcHandle.Instance = CRC;
+
+    /* The default polynomial is used */
+    CrcHandle.Init.DefaultPolynomialUse = DEFAULT_POLYNOMIAL_ENABLE;
+
+    /* The default init value is used */
+    CrcHandle.Init.DefaultInitValueUse = DEFAULT_INIT_VALUE_ENABLE;
+
+    /* The input data are not inverted */
+    CrcHandle.Init.InputDataInversionMode = CRC_INPUTDATA_INVERSION_BYTE;
+
+    /* The output data are not inverted */
+    CrcHandle.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_DISABLED;
+
+    /* The input data are 8 bits lenght */
+    CrcHandle.InputDataFormat = CRC_INPUTDATA_FORMAT_BYTES;
+
+    if (HAL_CRC_Init(&CrcHandle) != HAL_OK)
+    {
+        /* Initialization Error */
+        //Error_Handler();
+    }
+    /*
+  HAL_CRC_Accumulate(&CrcHandle, (uint32_t *)aDataBuffer, BUFFER_SIZE);*/
+}
+
+/*sigin  IO*/
+void SigInConfig(void)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+
+    /* Enable GPIOB clock */
+    __GPIOB_CLK_ENABLE();
+
+    GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStructure.Pull = GPIO_NOPULL;
+    GPIO_InitStructure.Pin = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStructure);
+    GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStructure.Pin = GPIO_PIN_14 | GPIO_PIN_15;
+    GPIO_InitStructure.Speed = GPIO_SPEED_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+}
+void ADC_DMA_CallBack(struct __DMA_HandleTypeDef *hdma);
+void ADC_DMA_CallBack(struct __DMA_HandleTypeDef *hdma)
+{
+}
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    HAL_ADC_Stop(hadc);
+#ifdef USE_ADC
+    ADC_SampleRelatedProcess(&aResultDMA[8]);
+#endif
+}
+void SigInADCIOCofnig(void)
+{
+    /* ### - 1 - Initialize ADC peripheral #################################### */
+    /*
+   *  Instance                  = ADC1.
+   *  ClockPrescaler            = PCLK divided by 4.
+   *  LowPowerAutoWait          = Disabled
+   *  LowPowerAutoPowerOff      = Disabled
+   *  Resolution                = 8 bit (increased to 16 bit with oversampler)
+   *  ScanConvMode              = ADC_SCAN_ENABLE 
+   *  DataAlign                 = Right
+   *  ContinuousConvMode        = Enabled
+   *  DiscontinuousConvMode     = Enabled
+   *  ExternalTrigConv          = ADC_SOFTWARE_START
+   *  ExternalTrigConvEdge      = None (Software start)
+   *  EOCSelection              = End Of Conversion event
+   *  DMAContinuousRequests     = ENABLE
+   */
+
+    AdcHandle.Instance = ADC1;
+
+    AdcHandle.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+    AdcHandle.Init.LowPowerAutoWait = DISABLE;
+    AdcHandle.Init.LowPowerAutoPowerOff = DISABLE;
+    AdcHandle.Init.Resolution = ADC_RESOLUTION8b;
+    AdcHandle.Init.ScanConvMode = ADC_SCAN_ENABLE;
+    AdcHandle.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    AdcHandle.Init.ContinuousConvMode = ENABLE;
+    AdcHandle.Init.DiscontinuousConvMode = DISABLE;
+    AdcHandle.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    AdcHandle.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    AdcHandle.Init.EOCSelection = EOC_SINGLE_CONV;
+    AdcHandle.Init.DMAContinuousRequests = ENABLE;
+    AdcHandle.Init.Overrun = OVR_DATA_OVERWRITTEN;
+
+    /* Initialize ADC peripheral according to the passed parameters */
+    if (HAL_ADC_Init(&AdcHandle) != HAL_OK)
+        ;
+
+    /* ### - 2 - Start calibration ############################################ */
+    if (HAL_ADCEx_Calibration_Start(&AdcHandle) != HAL_OK)
+        ;
+
+    /* ### - 3 - Channel configuration ######################################## */
+    /* Select Channel 9 to be converted */
+    sADCConfig.Channel = ADC_CHANNEL_9;
+    sADCConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
+    sADCConfig.SamplingTime = ADC_SAMPLETIME_41CYCLES_5;
+    if (HAL_ADC_ConfigChannel(&AdcHandle, &sADCConfig) != HAL_OK)
+        ;
+    // ADC1->SMPR = 0x05;
+    /* ### - 4 - Start conversion in DMA mode ################################# */
+    if (HAL_ADC_Start_DMA(&AdcHandle, (uint32_t *)&aResultDMA, sizeof(aResultDMA)) != HAL_OK)
+        ;
+}
+
+/**
+* @brief  ADC MSP Init
+* @param  hadc : ADC handle
+* @retval None
+*/
+void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc)
+{
+    GPIO_InitTypeDef GPIO_InitStruct;
+    static DMA_HandleTypeDef DmaHandle;
+
+    /*##-1- Enable peripherals and GPIO Clocks #################################*/
+    /* Enable GPIO clock ****************************************/
+    __GPIOB_CLK_ENABLE();
+    /* ADC1 Periph clock enable */
+    __ADC1_CLK_ENABLE();
+    /* Enable DMA1 clock */
+    __DMA1_CLK_ENABLE();
+
+    /*##- 2- Configure peripheral GPIO #########################################*/
+    /* ADC1 Channel9 GPIO pin configuration */
+    GPIO_InitStruct.Pin = GPIO_PIN_1;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    /*##- 3- Configure DMA #####################################################*/
+
+    /*********************** Configure DMA parameters ***************************/
+    DmaHandle.Instance = DMA1_Channel1;
+    DmaHandle.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    DmaHandle.Init.PeriphInc = DMA_PINC_DISABLE;
+    DmaHandle.Init.MemInc = DMA_MINC_ENABLE;
+    DmaHandle.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    DmaHandle.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    DmaHandle.Init.Mode = DMA_CIRCULAR;
+    DmaHandle.Init.Priority = DMA_PRIORITY_MEDIUM;
+    //DmaHandle.XferCpltCallback         = ADC_DMA_CallBack;
+
+    /* Deinitialize  & Initialize the DMA for new transfer */
+    HAL_DMA_DeInit(&DmaHandle);
+    HAL_DMA_Init(&DmaHandle);
+
+    /* Associate the DMA handle */
+    __HAL_LINKDMA(hadc, DMA_Handle, DmaHandle);
+
+    /* NVIC configuration for DMA Input data interrupt */
+    HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+}
+/*Interrupt*/
+void EXTI4_15_IRQHandler_Config(void)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+
+    /* Enable GPIOB clock */
+    __GPIOB_CLK_ENABLE();
+
+    /* Configure PB.13 pin as input floating */
+    GPIO_InitStructure.Mode = GPIO_MODE_IT_FALLING;
+    GPIO_InitStructure.Pull = GPIO_PULLUP;
+#if ISPLC_13_1X
+    GPIO_InitStructure.Pin = GPIO_PIN_10;
+#else
+    GPIO_InitStructure.Pin = GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12;
+#endif
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+    /* Enable and set EXTI line 4-15 Interrupt to the higher priority */
+    HAL_NVIC_SetPriority(EXTI4_15_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(EXTI4_15_IRQn);
+}
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    Signal_GPIO_EXTI_Callback(GPIO_Pin);
+    if (GPIO_Pin == GPIO_PIN_6) //无线IRQ中断，PB6
+    {
+        //UartSendBytes(USART1,(uint8_t*)"GPIO_PIN_6 EXIT \r\n",18);
+        Si4438_Interrupt_Handler(&Wireless_Buf);
+    }
+}
+/*Control pin */
+void InitControlPins(void)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+    /* Enable GPIOB clock */
+    __GPIOB_CLK_ENABLE();
+
+    GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStructure.Pin = GPIO_PIN_14 | GPIO_PIN_15;
+    GPIO_InitStructure.Speed = GPIO_SPEED_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+}
+void SelectControlPinChannal(unsigned char Channal)
+{
+    if (Channal == 0)
+    {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+    }
+    else if (Channal == 1)
+    {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
+    }
+    else if (Channal == 2)
+    {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
+    }
+    else
+    {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+    }
+}
+/*Sampe Time Tim6*/
+void InitSampeTime(void)
+{
+    SAMPE_TIME_CLK_ENABLE();
+#if 0
+  /* Set TIMx instance */
+  memset(&TimHandle,0,sizeof(TIM_HandleTypeDef));
+  TimHandle.Instance = SAMPE_TIME;
+
+  /* Initialize TIMx peripheral as follows:
+       + Period = 10000 - 1
+       + Prescaler = (SystemCoreClock/10000) - 1
+       + ClockDivision = 0
+       + Counter direction = Up
+  */
+  TimHandle.Init.Period            = 2150;//44.8uS.
+  TimHandle.Init.Prescaler         = 0;
+  TimHandle.Init.ClockDivision     = 0;
+  TimHandle.Init.CounterMode       = TIM_COUNTERMODE_UP;
+  TimHandle.Init.RepetitionCounter = 0;
+  if (HAL_TIM_Base_Init(&TimHandle) != HAL_OK);
+  
+  HAL_NVIC_SetPriority(SAMPE_TIME_IRQn, 1, 0);
+
+  /* Enable the TIMx global Interrupt */
+  HAL_NVIC_EnableIRQ(SAMPE_TIME_IRQn);
+  /*##-2- Start the TIM Base generation in interrupt mode ####################*/
+  /* Start Channel1 */
+  if (HAL_TIM_Base_Start_IT(&TimHandle) != HAL_OK);
+#endif
+    /*向上设计器模式*/
+    SAMPE_TIME->CR1 |= TIM_COUNTERMODE_UP;
+    /*重新加载寄存器*/
+    SAMPE_TIME->ARR = 2150;
+    /*分频系数*/
+    SAMPE_TIME->PSC = 0;
+    /*设置定时器中断优先级*/
+    HAL_NVIC_SetPriority(SAMPE_TIME_IRQn, 1, 0);
+    /* 使能定时器全局中断*/
+    HAL_NVIC_EnableIRQ(SAMPE_TIME_IRQn);
+    /*使能更新中断*/
+    SAMPE_TIME->DIER |= TIM_IT_UPDATE;
+    /*使能定时器*/
+    SAMPE_TIME->CR1 |= (TIM_CR1_CEN);
+}
+void DisableSampeTime(void)
+{
+    SAMPE_TIME->CR1 &= ~(TIM_CR1_CEN);
+    SAMPE_TIME->SR = ~(TIM_IT_UPDATE);
+    NVIC_ClearPendingIRQ(SAMPE_TIME_IRQn);
+    /*清计数器值*/
+    SAMPE_TIME->CNT = 0;
+}
+void EnableSampeTime(void)
+{
+    SAMPE_TIME->CNT = 0;
+    SAMPE_TIME->CR1 |= TIM_CR1_CEN;
+}
+void EnableSampeTime_Ex(void)
+{
+    SAMPE_TIME->CNT = 2140;
+    SAMPE_TIME->CR1 |= TIM_CR1_CEN;
+}
+/*****************************************************************
+*******************phase time time15************************
+*********************************************************************/
+void InitPhaseTime(void)
+{
+    /*开时钟源*/
+    PHASE_TIME_CLK_ENABLE();
+    /*向上设计器模式*/
+    PHASE_TIME->CR1 |= TIM_COUNTERMODE_UP;
+    /*重新加载寄存器*/
+    PHASE_TIME->ARR = 6666;
+    /*分频系数*/
+    PHASE_TIME->PSC = 23; //48000000/2000000 - 1
+    /*设置定时器中断优先级*/
+    HAL_NVIC_SetPriority(PHASE_TIME_IRQn, 0, 0);
+    /* 使能定时器全局中断*/
+    HAL_NVIC_EnableIRQ(PHASE_TIME_IRQn);
+    /*使能更新中断*/
+    PHASE_TIME->DIER |= TIM_IT_UPDATE;
+    /*使能定时器*/
+    PHASE_TIME->CR1 |= (TIM_CR1_CEN);
+}
+void DisablePhaseTime(void)
+{
+    /*关定时器*/
+    PHASE_TIME->CR1 &= ~(TIM_CR1_CEN);
+    /*清中断状态，清中断标志*/
+    PHASE_TIME->SR = ~(TIM_IT_UPDATE);
+    NVIC_ClearPendingIRQ(PHASE_TIME_IRQn);
+    /*清计数器值*/
+    PHASE_TIME->CNT = 0;
+}
+void EnablePhaseTime(void)
+{
+    /*使能定时器*/
+    PHASE_TIME->CR1 |= TIM_CR1_CEN;
+}
+
+/*****************************************************************
+*******************PWM out 38KHz use time1************************
+*********************************************************************/
+void Init38KhzOutTime(void)
+{
+    __TIM1_CLK_ENABLE();
+    __GPIOA_CLK_ENABLE();
+
+    memset(&TimHandle, 0, sizeof(TIM_HandleTypeDef));
+    memset(&sConfig, 0, sizeof(TIM_OC_InitTypeDef));
+    /* Common configuration for all channels */
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF2_TIM1;
+
+    /* Channel 1 configuration */
+    GPIO_InitStruct.Pin = GPIO_PIN_8;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    Period = (uint32_t)(48000000 / 38000);
+    TimHandle.Instance = TIM1;
+    TimHandle.Init.Prescaler = 0;
+    TimHandle.Init.Period = Period;
+    TimHandle.Init.ClockDivision = 0;
+    TimHandle.Init.CounterMode = TIM_COUNTERMODE_UP;
+    if (HAL_TIM_PWM_Init(&TimHandle) != HAL_OK)
+        ;
+
+    /*##-2- Configure the PWM channels #########################################*/
+    /* Common configuration for all channels */
+    sConfig.OCMode = TIM_OCMODE_PWM1;
+    sConfig.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfig.OCFastMode = TIM_OCFAST_ENABLE;
+
+    /* Set the pulse value for channel 1 */
+    sConfig.Pulse = Period / 2;
+    if (HAL_TIM_PWM_ConfigChannel(&TimHandle, &sConfig, TIM_CHANNEL_1) != HAL_OK)
+        ;
+
+    /*##-3- Start PWM signals generation #######################################*/
+    /* Start channel 1 */
+    if (HAL_TIM_PWM_Start(&TimHandle, TIM_CHANNEL_1) != HAL_OK)
+        ;
+}
+
+void Disable38KhzOutTime(void)
+{
+    TimHandle.Instance = TIM1;
+    HAL_TIM_PWM_Stop(&TimHandle, TIM_CHANNEL_1);
+}
+
+void Enable38KhzOutTime(void)
+{
+    TimHandle.Instance = TIM1;
+    HAL_TIM_PWM_Start(&TimHandle, TIM_CHANNEL_1);
+}
+
+/*PWM out 285KHz use time14 */
+void InitPWMTime(void)
+{
+    __TIM14_CLK_ENABLE();
+    __GPIOA_CLK_ENABLE();
+
+    memset(&TimHandle, 0, sizeof(TIM_HandleTypeDef));
+    memset(&sConfig, 0, sizeof(TIM_OC_InitTypeDef));
+    /* Common configuration for all channels */
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF4_TIM14;
+
+    /* Channel 1 configuration */
+    GPIO_InitStruct.Pin = GPIO_PIN_4;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    Period = LOCAL_FREQ;
+    TimHandle.Instance = TIM14;
+    TimHandle.Init.Prescaler = 0;
+    TimHandle.Init.Period = Period;
+    TimHandle.Init.ClockDivision = 0;
+    TimHandle.Init.CounterMode = TIM_COUNTERMODE_UP;
+    if (HAL_TIM_PWM_Init(&TimHandle) != HAL_OK)
+        ;
+
+    /*##-2- Configure the PWM channels #########################################*/
+    /* Common configuration for all channels */
+    sConfig.OCMode = TIM_OCMODE_PWM1;
+    sConfig.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfig.OCFastMode = TIM_OCFAST_ENABLE;
+
+    /* Set the pulse value for channel 1 */
+    sConfig.Pulse = Period / 2;
+    if (HAL_TIM_PWM_ConfigChannel(&TimHandle, &sConfig, TIM_CHANNEL_1) != HAL_OK)
+        ;
+
+    /*##-3- Start PWM signals generation #######################################*/
+    /* Start channel 1 */
+    if (HAL_TIM_PWM_Start(&TimHandle, TIM_CHANNEL_1) != HAL_OK)
+        ;
+}
+void DisablePWMOut(void)
+{
+    TIM14->CR1 &= ~(TIM_CR1_CEN);
+    TIM14->CNT = 0;
+}
+void EnablePWMOut(void)
+{
+    TIM14->CR1 |= TIM_CR1_CEN;
+}
+/*phase A TIM16*/
+void InitFskOutATime(void)
+{
+    uint32_t Period = 0;
+
+    __TIM16_CLK_ENABLE();
+    __GPIOA_CLK_ENABLE();
+    memset(&TimHandle, 0, sizeof(TIM_HandleTypeDef));
+    memset(&sConfig, 0, sizeof(TIM_OC_InitTypeDef));
+    /* Common configuration for all channels */
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF5_TIM16;
+
+    /* Channel 1 configuration */
+    GPIO_InitStruct.Pin = GPIO_PIN_6;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    Period = (uint32_t)(48000000 / 163800);
+    TimHandle.Instance = TIM16;
+    TimHandle.Init.Prescaler = 0;
+    TimHandle.Init.Period = Period;
+    TimHandle.Init.ClockDivision = 0;
+    TimHandle.Init.CounterMode = TIM_COUNTERMODE_UP;
+    if (HAL_TIM_PWM_Init(&TimHandle) != HAL_OK)
+        ;
+
+    /*##-2- Configure the PWM channels #########################################*/
+    /* Common configuration for all channels */
+    sConfig.OCMode = TIM_OCMODE_PWM1;
+    sConfig.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfig.OCFastMode = TIM_OCFAST_ENABLE;
+
+    /* Set the pulse value for channel 1 */
+    sConfig.Pulse = Period / 2;
+    if (HAL_TIM_PWM_ConfigChannel(&TimHandle, &sConfig, TIM_CHANNEL_1) != HAL_OK)
+        ;
+
+    /*##-3- Start PWM signals generation #######################################*/
+    /* Start channel 1 */
+    if (HAL_TIM_PWM_Start(&TimHandle, TIM_CHANNEL_1) != HAL_OK)
+        ;
+}
+void EnableFskOutATime(void)
+{
+    TIM16->CR1 |= TIM_CR1_CEN;
+    //TIM16->CNT = 0;
+    //TIM16->BDTR |= 1<<15;
+}
+void DisableFskOutATime(void)
+{
+    TIM16->CR1 &= ~(TIM_CR1_CEN);
+    //TIM16->BDTR &= ~(1<<15);
+    TIM16->CNT = 0;
+}
+void FskOutAHighBitFreq(void)
+{
+
+    uint16_t Tcnt;
+
+    Tcnt = TIM16->CNT;
+    TIM16->CR1 &= ~(TIM_CR1_CEN);
+    TIM16->CNT = Tcnt <= TCCR_LOAD175 ? Tcnt : //未反转过。
+                     Tcnt <= TCCR_LOAD164 ? TCCR_LOAD164 + 1 : Tcnt;
+    TIM16->ARR = TARR_LOAD164;
+    TIM16->CCR1 = TCCR_LOAD164;
+    TIM16->CR1 |= TIM_CR1_CEN;
+}
+void FskOutALowBitFreq(void)
+{
+    uint16_t Tcnt;
+
+    Tcnt = TIM16->CNT;
+    TIM16->CR1 &= ~(TIM_CR1_CEN);
+    TIM16->CNT = Tcnt >= TARR_LOAD175 ? TARR_LOAD175 - 1 : Tcnt >= TCCR_LOAD164 ? Tcnt : //比较翻转过。
+                                                               Tcnt >= TCCR_LOAD175 ? TCCR_LOAD175 - 1 : Tcnt;
+    TIM16->ARR = TARR_LOAD175;
+    TIM16->CCR1 = TCCR_LOAD175;
+    TIM16->CR1 |= TIM_CR1_CEN;
+}
+/*phase B Time17*/
+void InitFskOutBTime(void)
+{
+    uint32_t Period = 0;
+    __TIM17_CLK_ENABLE();
+    __GPIOA_CLK_ENABLE();
+    memset(&TimHandle, 0, sizeof(TIM_HandleTypeDef));
+    memset(&sConfig, 0, sizeof(TIM_OC_InitTypeDef));
+    /* Common configuration for all channels */
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF5_TIM17;
+
+    /* Channel 1 configuration */
+    GPIO_InitStruct.Pin = GPIO_PIN_7;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    Period = (uint32_t)(48000000 / 180000);
+    TimHandle.Instance = TIM17;
+    TimHandle.Init.Prescaler = 0;
+    TimHandle.Init.Period = Period;
+    TimHandle.Init.ClockDivision = 0;
+    TimHandle.Init.CounterMode = TIM_COUNTERMODE_UP;
+    if (HAL_TIM_PWM_Init(&TimHandle) != HAL_OK)
+        ;
+
+    /*##-2- Configure the PWM channels #########################################*/
+    /* Common configuration for all channels */
+    sConfig.OCMode = TIM_OCMODE_PWM1;
+    sConfig.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfig.OCFastMode = TIM_OCFAST_ENABLE;
+
+    /* Set the pulse value for channel 1 */
+    sConfig.Pulse = Period / 2;
+    if (HAL_TIM_PWM_ConfigChannel(&TimHandle, &sConfig, TIM_CHANNEL_1) != HAL_OK)
+        ;
+
+    /*##-3- Start PWM signals generation #######################################*/
+    /* Start channel 1 */
+    if (HAL_TIM_PWM_Start(&TimHandle, TIM_CHANNEL_1) != HAL_OK)
+        ;
+}
+void EnableFskOutBTime(void)
+{
+    TIM17->CR1 |= TIM_CR1_CEN;
+}
+void DisableFskOutBTime(void)
+{
+    TIM17->CR1 &= ~(TIM_CR1_CEN);
+    TIM17->CNT = 0;
+}
+void FskOutBHighBitFreq(void)
+{
+
+    uint16_t Tcnt;
+
+    Tcnt = TIM17->CNT;
+    TIM17->CR1 &= ~(TIM_CR1_CEN);
+    TIM17->CNT = Tcnt <= TCCR_LOAD175 ? Tcnt : //未反转过。
+                     Tcnt <= TCCR_LOAD164 ? TCCR_LOAD164 + 1 : Tcnt;
+    TIM17->ARR = TARR_LOAD164;
+    TIM17->CCR1 = TCCR_LOAD164;
+    TIM17->CR1 |= TIM_CR1_CEN;
+}
+void FskOutBLowBitFreq(void)
+{
+    uint16_t Tcnt;
+
+    Tcnt = TIM17->CNT;
+    TIM17->CR1 &= ~(TIM_CR1_CEN);
+    TIM17->CNT = Tcnt >= TARR_LOAD175 ? TARR_LOAD175 - 1 : Tcnt >= TCCR_LOAD164 ? Tcnt : //比较翻转过。
+                                                               Tcnt >= TCCR_LOAD175 ? TCCR_LOAD175 - 1 : Tcnt;
+    TIM17->ARR = TARR_LOAD175;
+    TIM17->CCR1 = TCCR_LOAD175;
+    TIM17->CR1 |= TIM_CR1_CEN;
+}
+/*Phase C Time3*/
+void InitFskOutCTime(void)
+{
+    uint32_t Period = 0;
+    __TIM3_CLK_ENABLE();
+    __GPIOB_CLK_ENABLE();
+
+    memset(&TimHandle, 0, sizeof(TIM_HandleTypeDef));
+    memset(&sConfig, 0, sizeof(TIM_OC_InitTypeDef));
+    /* Common configuration for all channels */
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF1_TIM3;
+
+    /* Channel 3 configuration */
+    GPIO_InitStruct.Pin = GPIO_PIN_0;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    Period = (uint32_t)(48000000 / 200000);
+    TimHandle.Instance = TIM3;
+    TimHandle.Init.Prescaler = 0;
+    TimHandle.Init.Period = Period;
+    TimHandle.Init.ClockDivision = 0;
+    TimHandle.Init.CounterMode = TIM_COUNTERMODE_UP;
+    if (HAL_TIM_PWM_Init(&TimHandle) != HAL_OK)
+        ;
+
+    /*##-2- Configure the PWM channels #########################################*/
+    /* Common configuration for all channels */
+    sConfig.OCMode = TIM_OCMODE_PWM1;
+    sConfig.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfig.OCFastMode = TIM_OCFAST_ENABLE;
+
+    /* Set the pulse value for channel 3 */
+    sConfig.Pulse = Period / 2;
+    if (HAL_TIM_PWM_ConfigChannel(&TimHandle, &sConfig, TIM_CHANNEL_3) != HAL_OK)
+        ;
+
+    /*##-3- Start PWM signals generation #######################################*/
+    /* Start channel 3 */
+    if (HAL_TIM_PWM_Start(&TimHandle, TIM_CHANNEL_3) != HAL_OK)
+        ;
+}
+void EnableFskOutCTime(void)
+{
+    TIM3->CR1 |= TIM_CR1_CEN;
+}
+void DisableFskOutCTime(void)
+{
+    TIM3->CR1 &= ~(TIM_CR1_CEN);
+    TIM3->CNT = 0;
+}
+void FskOutCHighBitFreq(void)
+{
+
+    uint16_t Tcnt;
+
+    Tcnt = TIM3->CNT;
+    TIM3->CR1 &= ~(TIM_CR1_CEN);
+    TIM3->CNT = Tcnt <= TCCR_LOAD175 ? Tcnt : //未反转过。
+                    Tcnt <= TCCR_LOAD164 ? TCCR_LOAD164 + 1 : Tcnt;
+    TIM3->ARR = TARR_LOAD164;
+    TIM3->CCR1 = TCCR_LOAD164;
+    TIM3->CR1 |= TIM_CR1_CEN;
+}
+void FskOutCLowBitFreq(void)
+{
+    uint16_t Tcnt;
+
+    Tcnt = TIM3->CNT;
+    TIM3->CR1 &= ~(TIM_CR1_CEN);
+    TIM3->CNT = Tcnt >= TARR_LOAD175 ? TARR_LOAD175 - 1 : Tcnt >= TCCR_LOAD164 ? Tcnt : //比较翻转过。
+                                                              Tcnt >= TCCR_LOAD175 ? TCCR_LOAD175 - 1 : Tcnt;
+    TIM3->ARR = TARR_LOAD175;
+    TIM3->CCR1 = TCCR_LOAD175;
+    TIM3->CR1 |= TIM_CR1_CEN;
+}
+
+/*Flash Read Write */
+void FLASHWrite(uint32_t offset, uint32_t *buf, uint16_t len)
+{
+    __IO uint32_t data32 = 0;
+    uint32_t Address = 0, PageError = 0;
+    HAL_FLASH_Unlock();
+
+    EraseInitStruct.TypeErase = TYPEERASE_PAGES;
+    EraseInitStruct.PageAddress = FLASH_USER_START_ADDR;
+    EraseInitStruct.NbPages = (FLASH_USER_END_ADDR - FLASH_USER_START_ADDR) / FLASH_PAGE_SIZE;
+
+    if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK)
+    {
+        while (1)
+            ;
+    }
+
+    /* Program the user Flash area word by word
+    (area defined by FLASH_USER_START_ADDR and FLASH_USER_END_ADDR) ***********/
+
+    Address = FLASH_USER_START_ADDR + offset;
+
+    while (len--)
+    {
+        if (HAL_FLASH_Program(TYPEPROGRAM_WORD, Address, *buf++) == HAL_OK)
+        {
+            Address = Address + 4;
+        }
+        else
+        {
+            while (1)
+            {
+            }
+        }
+    }
+    HAL_FLASH_Lock();
+}
+void FLASHRead(uint32_t offset, uint32_t *buf, uint16_t len)
+{
+    __IO uint32_t data32 = 0;
+    uint32_t Address = 0;
+    Address = FLASH_USER_START_ADDR + offset;
+
+    while (len--)
+    {
+        *buf++ = *(__IO uint32_t *)Address;
+        Address = Address + 4;
+    }
+}
+
+void USARTx_Init(void)
+{
+
+    UartHandleUp.Instance = EVAL_COM1;
+    UartHandleUp.Init.BaudRate = 9600;
+    UartHandleUp.Init.WordLength = UART_WORDLENGTH_9B;
+    UartHandleUp.Init.StopBits = UART_STOPBITS_1;
+    UartHandleUp.Init.Parity = UART_PARITY_EVEN;
+    UartHandleUp.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    UartHandleUp.Init.Mode = UART_MODE_TX_RX;
+
+    BSP_COM_Init(COM1, &UartHandleUp);
+
+    /*configure interrupt dbg port */
+    HAL_NVIC_SetPriority(EVAL_COM1_IRQn, 4, 0);
+    HAL_NVIC_EnableIRQ(EVAL_COM1_IRQn);
+
+    /*down port*/
+    UartHandleDown.Instance = EVAL_COM2;
+#ifdef MASTER
+    UartHandleDown.Init.BaudRate = 9600;
+#else
+    UartHandleDown.Init.BaudRate = 9600;
+#endif
+    UartHandleDown.Init.WordLength = UART_WORDLENGTH_9B;
+    UartHandleDown.Init.StopBits = UART_STOPBITS_1;
+    UartHandleDown.Init.Parity = UART_PARITY_EVEN;
+    UartHandleDown.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    UartHandleDown.Init.Mode = UART_MODE_TX_RX;
+    BSP_COM_Init(COM2, &UartHandleDown);
+    /*configure interrupt*/
+    HAL_NVIC_SetPriority(EVAL_COM2_IRQn, 4, 0);
+    HAL_NVIC_EnableIRQ(EVAL_COM2_IRQn);
+
+    STUpUartFrame.p_buf = gUpRxInterruptBuf;
+    STDownUartFrame.p_buf = gDownRxInterruptBuf;
+    if (HAL_UART_Receive_IT(&UartHandleUp, (uint8_t *)gUpRxBuffer, 1) != HAL_OK)
+        ;
+    if (HAL_UART_Receive_IT(&UartHandleDown, (uint8_t *)gDownRxBuffer, 1) != HAL_OK)
+        ;
+}
+void USER_UART_Hand(UART_HandleTypeDef *UartHandle)
+{
+    if (UartHandle->Instance == EVAL_COM1)
+    {
+        if (gRxUart1Flag == SET)
+        {
+            LowUpUartProcess();
+            gRxUart1Flag = RESET;
+        }
+    }
+    else if (UartHandle->Instance == EVAL_COM2)
+    {
+        if (gRxUart2Flag == SET)
+        {
+            LowDownUartProcess();
+            gRxUart2Flag = RESET;
+        }
+    }
+}
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *UartHandle)
+{
+    /* Set Transfer flag: trasfer complete*/
+    if (UartHandle->Instance == EVAL_COM1)
+        gTxUart1Flag = SET;
+    else if (UartHandle->Instance == EVAL_COM2)
+        gTxUart2Flag = SET;
+}
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *UartHandle)
+{
+    /*set reception flag:receive ok*/
+    if (UartHandle->Instance == EVAL_COM1)
+        gRxUart1Flag = SET;
+    else if (UartHandle->Instance == EVAL_COM2)
+    {
+        //gRxUart2Flag = SET;
+        LowDownUartProcess();
+    }
+}
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *UartHandle)
+{
+    /*
+  BSP_LED_On(LED1);
+  BSP_LED_On(LED2); 
+  BSP_LED_On(LED3);
+
+  if(UartHandle->Instance == EVAL_COM1)
+  { 
+    EVAL_COM1_FORCE_RESET();
+    EVAL_COM1_RELEASE_RESET();
+    BSP_COM_Init(COM1,&UartHandleUp);
+    memset(&STUpUartFrame,0,sizeof(STUpUartFrame));
+    gTxUart1Flag = SET;/ *=SET tx_compile* /
+    gRxUart1Flag = RESET;/ *=.RESET can receive* /
+    if(HAL_UART_Receive_IT(&UartHandleUp, (uint8_t *)gUpRxBuffer,1) != HAL_OK)
+    {
+     // Error_Handler();
+    }
+  }
+  if(UartHandle->Instance == EVAL_COM2)
+  { 
+    EVAL_COM2_FORCE_RESET();
+    EVAL_COM2_RELEASE_RESET();
+    BSP_COM_Init(COM2,&UartHandleDown);
+    memset(&STDownUartFrame,0,sizeof(STDownUartFrame));
+    gTxUart2Flag = SET;/ *=SET tx_compile* /
+    gRxUart2Flag = RESET;/ *=.RESET can receive* /
+    if(HAL_UART_Receive_IT(&UartHandleDown, (uint8_t *)gDownRxBuffer,1) != HAL_OK)
+    {
+     // Error_Handler();
+    }
+  }
+*/
+    UartHandle->ErrorCode = HAL_UART_ERROR_NONE;
+    // while (1)
+    //     ;
+}
+#if 0
+static void LowDownUartProcess(void)
+{
+    static uint8_t rx_len = 0;
+    uint8_t USART_RcvByte = gDownRxBuffer[0];
+    switch (STDownUartFrame.rx_step)
+    {
+    case 0:                        //head
+        if (USART_RcvByte == 0x67) //head 0x67
+        {
+            STDownUartFrame.rx_step = 1;
+            STDownUartFrame.head = USART_RcvByte;
+            STDownUartFrame.p_buf[0] = USART_RcvByte;
+            rx_len = 1;
+        }
+        else if (USART_RcvByte == 0x68)
+        {
+            STDownUartFrame.rx_step = 1;
+            STDownUartFrame.head = USART_RcvByte;
+            STDownUartFrame.p_buf[0] = USART_RcvByte;
+            rx_len = 1;
+        }
+        break;
+
+    case 1: //len byte.totol len.
+        if (STDownUartFrame.head == 0x67)
+        {
+            STDownUartFrame.len = USART_RcvByte;
+            STDownUartFrame.p_buf[rx_len++] = USART_RcvByte;
+            STDownUartFrame.rx_step = 2;
+            if (STDownUartFrame.p_buf == NULL)
+                STDownUartFrame.p_buf = gDownRxInterruptBuf;
+        }
+        else //addr.6byte.
+        {
+            STDownUartFrame.addr[rx_len - 1] = USART_RcvByte;
+            STDownUartFrame.p_buf[rx_len++] = USART_RcvByte;
+            if (rx_len >= 7)
+            {
+                STDownUartFrame.rx_step = 2;
+            }
+        }
+        break;
+    case 2:
+        if (STDownUartFrame.head == 0x67)
+        {
+            if (rx_len < STDownUartFrame.len)
+            {
+                STDownUartFrame.p_buf[rx_len] = USART_RcvByte;
+                rx_len++;
+            }
+            if (rx_len >= STDownUartFrame.len)
+            {
+                if (USART_RcvByte == 0x16)
+                {
+                    STDownUartFrame.p_buf[0] = STDownUartFrame.head;
+                    STDownUartFrame.p_buf[1] = STDownUartFrame.len;
+                    STDownUartFrame.is_flag = 1;
+                }
+                else
+                {
+                    STDownUartFrame.p_buf[0] = 0xfe;
+                    STDownUartFrame.p_buf[1] = STDownUartFrame.len;
+                    STDownUartFrame.is_flag = 1;
+                }
+
+                STDownUartFrame.rx_step = 0;
+                rx_len = 0;
+            }
+        }
+        else // 68 .. head
+        {
+            if (USART_RcvByte == 0x68)
+            {
+                STDownUartFrame.p_buf[rx_len++] = USART_RcvByte;
+                STDownUartFrame.rx_step = 3;
+            }
+            else
+            {
+                STDownUartFrame.rx_step = 0;
+                rx_len = 0;
+            }
+        }
+        break;
+    case 3: //命令字节。（控制码）
+    {
+        STDownUartFrame.cmd = USART_RcvByte;
+        STDownUartFrame.p_buf[rx_len++] = USART_RcvByte;
+        STDownUartFrame.rx_step = 4;
+    }
+    break;
+    case 4: //数据长度字节，接下来将要接收的数据总长度。
+        if (USART_RcvByte == 0)
+        {
+            STDownUartFrame.rx_step = 6;
+            STDownUartFrame.len_sub = 0;
+            STDownUartFrame.p_buf[rx_len++] = USART_RcvByte;
+            break;
+        }
+        else if (USART_RcvByte >= (MAXDOWNBUF - 32))
+        {
+            STDownUartFrame.len_sub = (MAXDOWNBUF - 32);
+            STDownUartFrame.is_flag = 2; //接收长度位有错。
+        }
+        else
+        {
+            STDownUartFrame.len_sub = USART_RcvByte;
+            STDownUartFrame.p_buf[rx_len++] = USART_RcvByte;
+        }
+        STDownUartFrame.rx_step = 5;
+        break;
+    case 5:
+        if (rx_len < STDownUartFrame.len_sub + 10)
+        {
+            STDownUartFrame.p_buf[rx_len++] = USART_RcvByte;
+        }
+        if (rx_len >= STDownUartFrame.len_sub + 10)
+        {
+            STDownUartFrame.rx_step = 6;
+        }
+        break;
+    case 6:
+
+        STDownUartFrame.sum = USART_RcvByte;
+        STDownUartFrame.p_buf[rx_len++] = USART_RcvByte;
+        STDownUartFrame.rx_step = 7;
+        break;
+
+    case 7:
+        if (USART_RcvByte == 0x16)
+        {
+            STDownUartFrame.is_flag = 1;
+            STDownUartFrame.rx_step = 0;
+            STDownUartFrame.end_char = USART_RcvByte;
+            STDownUartFrame.p_buf[rx_len++] = USART_RcvByte;
+            STDownUartFrame.len = rx_len;
+        }
+        rx_len = 0;
+        break;
+    default:
+        rx_len = 0;
+        STDownUartFrame.rx_step = 0;
+        STDownUartFrame.is_flag = 0;
+        break;
+    }
+
+    STDownUartFrame.Over_time_count = 5;
+
+    /*enable interrupt for receive next buffer*/
+    if (HAL_UART_Receive_IT(&UartHandleDown, (uint8_t *)gDownRxBuffer, 1) != HAL_OK)
+    {
+        //Error_Handler();
+    }
+}
+#else
+static void LowDownUartProcess(void)
+{
+    uint8_t USART_RcvByte = gDownRxBuffer[0];
+//    static uint8_t rx_len = 0;
+
+    if((STDownUartFrame.is_flag & 0x01)==0)
+    {
+        STDownUartFrame.Over_time_count = 100;
+        STDownUartFrame.p_buf[STDownUartFrame.len] = USART_RcvByte;
+        STDownUartFrame.len ++;
+    }
+   
+
+    /*enable interrupt for receive next buffer*/
+   // if (HAL_UART_Receive_IT(&UartHandleDown, (uint8_t *)gDownRxBuffer, 1) != HAL_OK)
+    //{
+        //Error_Handler();
+    //}
+}
+
+
+#endif
+static void LowUpUartProcess(void)
+{
+    static uint8_t rx_len = 0;
+    uint8_t USART_RcvByte = gUpRxBuffer[0];
+    switch (STUpUartFrame.rx_step)
+    {
+    case 0:                        //head
+        if (USART_RcvByte == 0x67) //head 0x67
+        {
+            STUpUartFrame.rx_step = 1;
+            STUpUartFrame.head = USART_RcvByte;
+            STUpUartFrame.p_buf[0] = USART_RcvByte;
+            rx_len = 1;
+        }
+        else if (USART_RcvByte == 0x68)
+        {
+            STUpUartFrame.rx_step = 1;
+            STUpUartFrame.head = USART_RcvByte;
+            STUpUartFrame.p_buf[0] = USART_RcvByte;
+            rx_len = 1;
+        }
+        break;
+
+    case 1: //len byte.totol len.
+        if (STUpUartFrame.head == 0x67)
+        {
+            STUpUartFrame.len = USART_RcvByte;
+            STUpUartFrame.p_buf[rx_len++] = USART_RcvByte;
+            STUpUartFrame.rx_step = 2;
+            if (STUpUartFrame.p_buf == NULL)
+                STUpUartFrame.p_buf = gUpRxInterruptBuf;
+        }
+        else //addr.6byte.
+        {
+            STUpUartFrame.p_buf[rx_len++] = USART_RcvByte;
+            if (rx_len >= 7)
+            {
+                STUpUartFrame.rx_step = 2;
+            }
+        }
+        break;
+    case 2:
+        if (STUpUartFrame.head == 0x67)
+        {
+            if (rx_len < STUpUartFrame.len)
+            {
+                STUpUartFrame.p_buf[rx_len] = USART_RcvByte;
+                rx_len++;
+            }
+            if (rx_len >= STUpUartFrame.len)
+            {
+                if (USART_RcvByte == 0x16)
+                {
+                    STUpUartFrame.p_buf[0] = STUpUartFrame.head;
+                    STUpUartFrame.p_buf[1] = STUpUartFrame.len;
+                    STUpUartFrame.is_flag = 1;
+                }
+                else
+                {
+                    STUpUartFrame.p_buf[0] = 0xfe;
+                    STUpUartFrame.p_buf[1] = STUpUartFrame.len;
+                    STUpUartFrame.is_flag = 1;
+                }
+
+                STUpUartFrame.rx_step = 0;
+                rx_len = 0;
+            }
+        }
+        else // 68 .. head
+        {
+            if (USART_RcvByte == 0x68)
+            {
+                STUpUartFrame.p_buf[rx_len++] = USART_RcvByte;
+                STUpUartFrame.rx_step = 3;
+            }
+            else
+            {
+                STUpUartFrame.rx_step = 0;
+                rx_len = 0;
+            }
+        }
+        break;
+    case 3: //命令字节。（控制码）
+    {
+        STUpUartFrame.cmd = USART_RcvByte;
+        STUpUartFrame.p_buf[rx_len++] = USART_RcvByte;
+        STUpUartFrame.rx_step = 4;
+    }
+    break;
+    case 4: //数据长度字节，接下来将要接收的数据总长度。
+        if (USART_RcvByte == 0)
+        {
+            STUpUartFrame.rx_step = 6;
+            STUpUartFrame.len_sub = 0;
+            STUpUartFrame.p_buf[rx_len++] = USART_RcvByte;
+            break;
+        }
+        else if (USART_RcvByte >= (MAXDOWNBUF - 32))
+        {
+            STUpUartFrame.len_sub = (MAXDOWNBUF - 32);
+            STUpUartFrame.is_flag = 2; //接收长度位有错。
+        }
+        else
+        {
+            STUpUartFrame.len_sub = USART_RcvByte;
+            STUpUartFrame.p_buf[rx_len++] = USART_RcvByte;
+        }
+        STUpUartFrame.rx_step = 5;
+        break;
+    case 5:
+        if (rx_len < STUpUartFrame.len_sub + 10)
+        {
+            STUpUartFrame.p_buf[rx_len++] = USART_RcvByte;
+        }
+        if (rx_len >= STUpUartFrame.len_sub + 10)
+        {
+            STUpUartFrame.rx_step = 6;
+        }
+        break;
+    case 6:
+
+        STUpUartFrame.sum = USART_RcvByte;
+        STUpUartFrame.p_buf[rx_len++] = USART_RcvByte;
+        STUpUartFrame.rx_step = 7;
+        break;
+
+    case 7:
+        if (USART_RcvByte == 0x16)
+        {
+            STUpUartFrame.is_flag = 1;
+            STUpUartFrame.rx_step = 0;
+            STUpUartFrame.end_char = USART_RcvByte;
+            STUpUartFrame.p_buf[rx_len++] = USART_RcvByte;
+            STUpUartFrame.len = rx_len;
+        }
+        rx_len = 0;
+        break;
+    default:
+        rx_len = 0;
+        STUpUartFrame.rx_step = 0;
+        STUpUartFrame.is_flag = 0;
+        break;
+    }
+    /*FREE RTOS times 50ms per tick*/
+    STUpUartFrame.Over_time_count = 5;
+
+    /*enable interrupt for receive next buffer*/
+    if (HAL_UART_Receive_IT(&UartHandleUp, (uint8_t *)gUpRxBuffer, 1) != HAL_OK)
+    {
+        //Error_Handler();
+    }
+}
+
+

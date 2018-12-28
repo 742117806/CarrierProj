@@ -1,0 +1,110 @@
+[Stack]
+FillEnabled=0
+OverflowWarningsEnabled=1
+WarningThreshold=90
+SpWarningsEnabled=1
+WarnLogOnly=1
+UseTrigger=1
+TriggerName=main
+LimitSize=0
+ByteLimit=50
+[Interrupts]
+Enabled=1
+[MemConfig]
+Base=1
+Manual=0
+Ddf=1
+TypeViol=0
+Stop=1
+[Simulator]
+Freq=10000000
+MultiCoreRunAll=1
+[DebugChecksum]
+Checksum=1248242646
+[Exceptions]
+StopOnUncaught=_ 0
+StopOnThrow=_ 0
+[CodeCoverage]
+Enabled=_ 0
+[CallStack]
+ShowArgs=0
+[Disassembly]
+MixedMode=0
+[SWOTraceHWSettings]
+OverrideDefaultClocks=0
+CpuClock=48000000
+ClockAutoDetect=1
+ClockWanted=2000000
+JtagSpeed=2000000
+Prescaler=24
+TimeStampPrescIndex=0
+TimeStampPrescData=0
+PcSampCYCTAP=1
+PcSampPOSTCNT=15
+PcSampIndex=0
+DataLogMode=0
+ITMportsEnable=0
+ITMportsTermIO=0
+ITMportsLogFile=0
+ITMlogFile=$PROJ_DIR$\ITM.log
+[stlink]
+stlinkserialNo=052CDA7D
+stlinkfoundProbes=
+[struct_types]
+Fmt0=struct si4438_PART_INFO_Reply-CHIPREV	4	0
+Fmt1=struct si4438_PART_INFO_Reply-PART	4	0
+[array_types]
+Fmt0=unsigned char[224]	4	0
+Fmt1=unsigned char[3]	4	0
+[Trace2]
+Enabled=0
+ShowSource=0
+[SWOTraceWindow]
+PcSampling=0
+InterruptLogs=0
+ForcedTimeStamps=0
+EventCPI=0
+EventEXC=0
+EventFOLD=0
+EventLSU=0
+EventSLEEP=0
+[DataLog]
+LogEnabled=0
+SumEnabled=0
+GraphEnabled=0
+ShowTimeLog=1
+ShowTimeSum=1
+[InterruptLog]
+LogEnabled=0
+SumEnabled=0
+GraphEnabled=0
+ShowTimeLog=1
+ShowTimeSum=1
+SumSortOrder=0
+[Log file]
+LoggingEnabled=_ 0
+LogFile=_ ""
+Category=_ 0
+[TermIOLog]
+LoggingEnabled=_ 0
+LogFile=_ ""
+[CallStackLog]
+Enabled=0
+[DriverProfiling]
+Enabled=0
+Mode=3
+Graph=0
+Symbiont=0
+Exclusions=
+[Disassemble mode]
+mode=0
+[Breakpoints2]
+Bp0=_ 0 "EMUL_CODE" "{$PROJ_DIR$\API\Src\sample.c}.321.5" 0 0 1 "" 0 "" 0
+Count=1
+[Aliases]
+A0=_ "C:\Users\Administrator\Desktop\(0201)carrier+wireless V1.3\API\Src\main.c" ""
+A1=_ "E:\Devin\Data\载波+无线\双模验证测试\(112514)carrier+wireless_A V1.0\STM32F0xx_HAL_Driver\Src\stm32f0xx_hal_dma.c" ""
+A2=_ "E:\Devin\Data\载波+无线\双模验证测试\carrier+wireless_A V1.0\STM32F0xx_HAL_Driver\Src\stm32f0xx_hal_dma.c" "E:\Devin\Data\载波+无线\双模验证测试\(112514)carrier+wireless_A V1.0\STM32F0xx_HAL_Driver\Src\stm32f0xx_hal_dma.c"
+A3=_ "E:\工作项目\双模电力载波_无线\电力载波程序固件\(0201)carrier+wireless V1.3\STM32F0xx_HAL_Driver\Src\stm32f0xx_hal_spi.c" ""
+Count=4
+SuppressDialog=1
